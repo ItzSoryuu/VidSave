@@ -1,0 +1,4 @@
+{
+  "watch": ["server.js"],
+  "ignore": ["temp/*", "bin/*", "node_modules/*", "src/*", "dist/*"]
+}
