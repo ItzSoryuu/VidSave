@@ -54,7 +54,7 @@ function cleanFilename(str) {
 }
 
 // Execute yt-dlp command with arguments
-function runYtDlp(args) {
+function runYtDlp(args, onSpawn) {
   return new Promise((resolve, reject) => {
     const finalArgs = [...args];
     if (FFMPEG_LOCATION && !finalArgs.includes('--ffmpeg-location')) {
@@ -65,6 +65,8 @@ function runYtDlp(args) {
     const proc = spawn(YTDLP_BIN, finalArgs, { windowsHide: true });
     let stdout = '';
     let stderr = '';
+
+    onSpawn?.(proc);
 
     proc.stdout.on('data', data => {
       stdout += data.toString();
@@ -328,7 +330,9 @@ async function getInstagramInfo(url) {
     title = oembedResp.data.title || title;
     uploader = oembedResp.data.author_name || uploader;
     thumbnail = oembedResp.data.thumbnail_url || null;
-  } catch (_) {}
+  } catch {
+    // oEmbed is best-effort; yt-dlp metadata below is enough on its own.
+  }
 
   return {
     platform: 'instagram',
@@ -355,6 +359,12 @@ async function getInstagramInfo(url) {
 
 // ─── DOWNLOAD HANDLERS ─────────────────────────────────────────────────────
 
+// Downloads are served as a plain `Content-Disposition: attachment` response so
+// the browser's own download manager owns progress, resume and cancellation.
+// An earlier version tried to rebuild the progress bar in-page, which required
+// streaming the whole file through JS memory and still had no real numbers to
+// show, because yt-dlp writes the file to disk before the response begins.
+
 // Download via direct URL stream (for TikTok direct links)
 async function streamDirect(res, directUrl, title, ext) {
   const resp = await axios.get(directUrl, {
@@ -380,6 +390,29 @@ async function streamDirect(res, directUrl, title, ext) {
   });
 }
 
+// yt-dlp writes the whole file into TEMP_DIR before we can stream it, so a
+// cancelled or crashed download can strand a partial file there. Anything older
+// than TEMP_MAX_AGE_MS is a leftover from an earlier run and is safe to drop.
+const TEMP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+
+function sweepTempDir() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(TEMP_DIR);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    const full = path.join(TEMP_DIR, name);
+    try {
+      if (now - fs.statSync(full).mtimeMs > TEMP_MAX_AGE_MS) fs.unlinkSync(full);
+    } catch {
+      // Still locked by a running download; the next sweep will retry.
+    }
+  }
+}
+
 // Download via standalone yt-dlp and ffmpeg (merges cleanly into standard MP4 / MP3)
 async function downloadWithYtDlp(res, url, formatSelector, title, ext, type) {
   const fileId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
@@ -398,22 +431,61 @@ async function downloadWithYtDlp(res, url, formatSelector, title, ext, type) {
     args.push('--merge-output-format', 'mp4');
   }
 
+  // The browser owns cancellation, but it can only drop the HTTP connection —
+  // the yt-dlp child process has to be killed from here or it keeps downloading.
+  let child = null;
+  let abandoned = false;
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    abandoned = true;
+    if (child) {
+      // On Windows, child.kill() only sends SIGTERM which yt-dlp/ffmpeg often ignore.
+      // Use taskkill /F /T to forcefully kill the whole process tree.
+      if (process.platform === 'win32') {
+        try { spawn('taskkill', ['/F', '/T', '/PID', child.pid], { windowsHide: true }); } catch { /* ignore */ }
+      } else {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      }
+    }
+  });
+
   // Execute download
-  await runYtDlp(args);
+  try {
+    await runYtDlp(args, (proc) => { child = proc; });
+  } catch (err) {
+    if (abandoned) return;
+    throw err;
+  }
+
+  if (abandoned) {
+    // The client left; drop whatever yt-dlp managed to write.
+    removeTempFiles(fileId);
+    return;
+  }
 
   // Find the generated file in TEMP_DIR
   const expectedExt = type === 'audio' ? 'mp3' : 'mp4';
   const outFilePath = path.join(TEMP_DIR, `${fileId}.${expectedExt}`);
 
-  if (!fs.existsSync(outFilePath)) {
-    // Check if any file with fileId exists
-    const files = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(fileId));
-    if (files.length === 0) throw new Error('File hasil download tidak ditemukan di server.');
-    const actualFilePath = path.join(TEMP_DIR, files[0]);
-    return sendFileAndCleanup(res, actualFilePath, title, expectedExt, type);
+  if (fs.existsSync(outFilePath)) {
+    return sendFileAndCleanup(res, outFilePath, title, expectedExt, type);
   }
 
-  return sendFileAndCleanup(res, outFilePath, title, expectedExt, type);
+  // Check if any file with fileId exists
+  const files = fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(fileId));
+  if (files.length === 0) throw new Error('File hasil download tidak ditemukan di server.');
+  return sendFileAndCleanup(res, path.join(TEMP_DIR, files[0]), title, expectedExt, type);
+}
+
+// Delete every artefact belonging to one download attempt (final file + .part)
+function removeTempFiles(fileId) {
+  try {
+    for (const name of fs.readdirSync(TEMP_DIR).filter(f => f.startsWith(fileId))) {
+      try { fs.unlinkSync(path.join(TEMP_DIR, name)); } catch { /* locked */ }
+    }
+  } catch {
+    // TEMP_DIR unreadable; the sweeper will handle it.
+  }
 }
 
 function sendFileAndCleanup(res, filePath, title, ext, type) {
@@ -430,7 +502,9 @@ function sendFileAndCleanup(res, filePath, title, ext, type) {
   const cleanup = () => {
     try {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch (_) {}
+    } catch {
+      // A locked file (e.g. cancelled download) is left for the next sweep.
+    }
   };
 
   res.on('finish', cleanup);
@@ -467,22 +541,33 @@ app.get('/api/info', async (req, res) => {
   }
 });
 
-// GET /api/download
+// GET /api/download — streams the file straight to the browser as an attachment.
+// The browser download manager shows the real progress and offers cancel/resume,
+// so the client never has to buffer or poll anything.
 app.get('/api/download', async (req, res) => {
   const { url, platform, formatSelector, directUrl, type, ext, title } = req.query;
   if (!url || !platform) return res.status(400).json({ error: 'URL and platform required' });
 
   try {
     if (directUrl) {
-      // Direct stream for TikTok
-      await streamDirect(res, directUrl, title, ext || 'mp4');
+      await streamDirect(res, directUrl, title || 'video', ext || 'mp4');
     } else {
-      // Standalone yt-dlp + ffmpeg (works for YouTube, Instagram, and TikTok)
-      await downloadWithYtDlp(res, url, formatSelector, title, ext || 'mp4', type || 'video');
+      await downloadWithYtDlp(res, url, formatSelector, title || 'video', ext || 'mp4', type || 'video');
     }
   } catch (err) {
     console.error(`[${platform}] Download error:`, err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
+    if (res.headersSent) {
+      // The browser already started saving; the only useful action is to stop.
+      return res.destroy();
+    }
+    const message = err.message || 'Download gagal';
+    res.status(500).json({
+      error: message.includes('Requested format is not available')
+        ? 'Format video tidak tersedia untuk sumber ini.'
+        : message.includes('Forbidden') || message.includes('HTTP Error 4')
+          ? 'Sumber menolak permintaan unduhan. Coba video lain atau beberapa saat lagi.'
+          : message.slice(0, 200),
+    });
   }
 });
 
@@ -499,4 +584,6 @@ app.get('/api/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`VidSave backend running at http://localhost:${PORT}`);
   console.log(`Using standalone binaries: yt-dlp: ${YTDLP_BIN}, ffmpeg: ${FFMPEG_LOCATION || 'system'}`);
+  sweepTempDir();
+  setInterval(sweepTempDir, 10 * 60 * 1000).unref();
 });
